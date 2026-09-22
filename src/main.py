@@ -156,7 +156,7 @@ def fallback_explanation(repo: Repository) -> str:
     return "توضیح رسمی برای این پروژه در صفحهٔ GitHub ثبت نشده است؛ برای شناخت دقیق‌تر، فایل README را ببینید."
 
 
-def explain_in_persian(repo: Repository, client=None, model: str = "gpt-5-mini") -> str:
+def explain_in_persian(repo: Repository, client=None, model: str = "gemini-3.5-flash-lite") -> str:
     if client is None:
         return fallback_explanation(repo)
 
@@ -168,20 +168,25 @@ def explain_in_persian(repo: Repository, client=None, model: str = "gpt-5-mini")
 توضیح رسمی GitHub: {repo.description or 'ثبت نشده'}
 """.strip()
     try:
-        response = client.responses.create(
+        from google.genai import types
+
+        response = client.models.generate_content(
             model=model,
-            instructions="پاسخ را فقط به فارسی روان و فنی برگردان.",
-            input=prompt,
-            max_output_tokens=180,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction="پاسخ را فقط به فارسی روان و فنی برگردان.",
+                temperature=0.2,
+                max_output_tokens=180,
+            ),
         )
-        text = _clean(getattr(response, "output_text", ""))
+        text = _clean(getattr(response, "text", ""))
         return text or fallback_explanation(repo)
     except Exception as exc:  # keep delivery alive if one AI request fails
         LOG.warning("Persian explanation failed for %s: %s", repo.name, exc)
         return fallback_explanation(repo)
 
 
-def build_message(period: str, repositories: Iterable[Repository], client=None, model: str = "gpt-5-mini") -> str:
+def build_message(period: str, repositories: Iterable[Repository], client=None, model: str = "gemini-3.5-flash-lite") -> str:
     now = datetime.now(ZoneInfo(os.getenv("TIMEZONE", "Asia/Tehran")))
     lines = [
         f"<b>ترندهای {html.escape(PERIOD_LABELS[period])} GitHub</b>",
@@ -260,14 +265,14 @@ def periods_for_run(period: str, now: datetime) -> list[str]:
     return result
 
 
-def make_openai_client():
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+def make_gemini_client():
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
-        LOG.warning("OPENAI_API_KEY is empty; using GitHub descriptions as fallback")
+        LOG.warning("GEMINI_API_KEY is empty; using GitHub descriptions as fallback")
         return None
-    from openai import OpenAI
+    from google import genai
 
-    return OpenAI(api_key=api_key)
+    return genai.Client(api_key=api_key)
 
 
 def main() -> int:
@@ -281,15 +286,15 @@ def main() -> int:
     periods = periods_for_run(args.period, now)
     limit = max(1, min(int(os.getenv("TOP_N", "10")), 20))
     github_token = os.getenv("GITHUB_TOKEN", "").strip()
-    openai_model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-    client = make_openai_client()
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    client = make_gemini_client()
 
     for period in periods:
         LOG.info("Fetching %s GitHub trends", period)
         repositories = fetch_trending(period, limit, github_token)
         if not repositories:
             raise RuntimeError(f"No repositories found for {period}")
-        message = build_message(period, repositories, client=client, model=openai_model)
+        message = build_message(period, repositories, client=client, model=gemini_model)
         send_telegram(message, os.getenv("TELEGRAM_BOT_TOKEN", "").strip(), os.getenv("TELEGRAM_CHAT_ID", "").strip())
         LOG.info("Sent %s trends", period)
     return 0
