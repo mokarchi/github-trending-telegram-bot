@@ -33,10 +33,10 @@ Settings → Secrets and variables → Actions → New repository secret
 ```text
 TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID
-OPENAI_API_KEY
+GEMINI_API_KEY
 ```
 
-کلید OpenAI برای توضیح فارسی استفاده می‌شود. اگر موقتاً آن را نگذاری، بات همچنان ارسال می‌کند اما فقط توضیح رسمی GitHub را با یک متن فارسی ساده نمایش می‌دهد.
+کلید Gemini از Google AI Studio برای توضیح فارسی استفاده می‌شود. مدل پیش‌فرض `gemini-3.5-flash-lite` است. اگر موقتاً کلید را نگذاری، بات همچنان ارسال می‌کند اما فقط توضیح رسمی GitHub را با یک متن فارسی ساده نمایش می‌دهد.
 
 ۵. در تب Actions، workflow با نام `GitHub Trending to Telegram` را باز کن و با گزینه‌ی `Run workflow` یک‌بار `all` را اجرا کن.
 
@@ -71,4 +71,3 @@ python src/main.py --period all
 ## نکته‌ی فنی
 
 GitHub صفحه‌ی Trending را به‌صورت عمومی نمایش می‌دهد اما API رسمی مستقیمی برای «ترند» ندارد؛ کد ابتدا همان صفحه را می‌خواند و اگر ساختار صفحه موقتاً عوض شده باشد، از جست‌وجوی ریپوهای تازه‌ساخته‌شده به‌عنوان fallback استفاده می‌کند.
-
