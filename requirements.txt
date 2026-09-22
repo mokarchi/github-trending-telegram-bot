@@ -1,0 +1,4 @@
+beautifulsoup4>=4.13,<5
+openai>=1.68,<2
+requests>=2.32,<3
+
