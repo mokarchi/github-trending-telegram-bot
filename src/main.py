@@ -279,25 +279,26 @@ def merge_sources(
     hacker_news_repositories: list[Repository],
     limit: int,
 ) -> list[Repository]:
-    """Keep GitHub as the primary signal while reserving room for HN discoveries."""
+    """Return up to ``limit`` repositories from each source, without duplicates."""
     result: list[Repository] = []
     seen: set[str] = set()
 
     def add(repository: Repository) -> None:
         key = _repository_key(repository)
-        if key not in seen and len(result) < limit:
+        if key not in seen and len(result) < limit * 2:
             result.append(repository)
             seen.add(key)
 
-    github_quota = max(1, limit - max(1, limit // 3))
-    for repository in github_repositories[:github_quota]:
+    for repository in github_repositories[:limit]:
         add(repository)
-    for repository in hacker_news_repositories[: max(1, limit // 3)]:
+    hacker_news_count = 0
+    for repository in hacker_news_repositories:
+        before = len(result)
         add(repository)
-    for repository in github_repositories[github_quota:]:
-        add(repository)
-    for repository in hacker_news_repositories[max(1, limit // 3) :]:
-        add(repository)
+        if len(result) > before:
+            hacker_news_count += 1
+        if hacker_news_count >= limit:
+            break
     return result
 
 
@@ -340,7 +341,7 @@ def explain_in_persian(repo: Repository, client=None, model: str = "gemini-3.5-f
 def build_message(period: str, repositories: Iterable[Repository], client=None, model: str = "gemini-3.5-flash-lite") -> str:
     now = datetime.now(ZoneInfo(os.getenv("TIMEZONE", "Asia/Tehran")))
     lines = [
-        f"<b>ترندهای {html.escape(PERIOD_LABELS[period])} GitHub</b>",
+        f"<b>ترندهای {html.escape(PERIOD_LABELS[period])} GitHub و Hacker News</b>",
         f"<i>{now:%Y-%m-%d %H:%M} به وقت تهران</i>",
         "",
     ]
