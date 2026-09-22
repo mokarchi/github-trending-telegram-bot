@@ -13,6 +13,7 @@ on:
           - daily
           - weekly
           - monthly
+          - dotnet
           - all
   schedule:
     - cron: "30 6 * * *"
@@ -49,4 +50,6 @@ jobs:
           TOP_N: 10
           WEEKLY_DAY: 0
           MONTHLY_DAY: 1
+          DOTNET_LOOKBACK_HOURS: 26
+          DOTNET_MAX_ITEMS: 10
         run: python src/main.py --period "${{ github.event.inputs.period || 'auto' }}"
