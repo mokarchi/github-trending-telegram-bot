@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import html
 import logging
 import os
@@ -12,7 +13,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -21,6 +22,8 @@ from bs4 import BeautifulSoup
 
 LOG = logging.getLogger("github-trending-bot")
 GITHUB_TRENDING_URL = "https://github.com/trending"
+GITHUB_API_URL = "https://api.github.com"
+HACKER_NEWS_API_URL = "https://hacker-news.firebaseio.com/v0"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 PERIOD_LABELS = {
     "daily": "روزانه",
@@ -39,6 +42,8 @@ class Repository:
     stars: str
     forks: str
     stars_gained: str
+    source: str = "GitHub"
+    source_score: str = ""
 
 
 def _clean(value: str | None) -> str:
@@ -150,6 +155,152 @@ def fetch_recently_created(limit: int, days: int, github_token: str = "") -> lis
     ]
 
 
+def _github_repo_name(url: str) -> str | None:
+    parsed = urlparse(url)
+    if parsed.netloc.lower() not in {"github.com", "www.github.com"}:
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 2:
+        return None
+    owner, repo = parts[0], parts[1].removesuffix(".git")
+    if not owner or not repo:
+        return None
+    return f"{owner}/{repo}"
+
+
+def _fetch_hacker_news_item(item_id: int) -> dict | None:
+    response = requests.get(f"{HACKER_NEWS_API_URL}/item/{item_id}.json", timeout=15)
+    response.raise_for_status()
+    item = response.json()
+    return item if isinstance(item, dict) else None
+
+
+def _github_repository_from_hn(
+    item: dict, github_token: str = ""
+) -> Repository | None:
+    full_name = _github_repo_name(item.get("url", ""))
+    if not full_name:
+        return None
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "github-trending-telegram-bot/1.0",
+    }
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
+
+    try:
+        response = requests.get(
+            f"{GITHUB_API_URL}/repos/{full_name}", headers=headers, timeout=20
+        )
+        response.raise_for_status()
+        data = response.json()
+        return Repository(
+            name=data.get("full_name", full_name),
+            url=data.get("html_url", f"https://github.com/{full_name}"),
+            description=_clean(data.get("description")) or _clean(item.get("title")),
+            language=data.get("language") or "نامشخص",
+            stars=str(data.get("stargazers_count", 0)),
+            forks=str(data.get("forks_count", 0)),
+            stars_gained="",
+            source="Hacker News",
+            source_score=str(item.get("score", 0)),
+        )
+    except requests.RequestException as exc:
+        LOG.debug("Could not enrich HN repository %s from GitHub: %s", full_name, exc)
+        return Repository(
+            name=full_name,
+            url=f"https://github.com/{full_name}",
+            description=_clean(item.get("title")),
+            language="نامشخص",
+            stars="0",
+            forks="0",
+            stars_gained="",
+            source="Hacker News",
+            source_score=str(item.get("score", 0)),
+        )
+
+
+def fetch_hacker_news(
+    period: str, limit: int, github_token: str = ""
+) -> list[Repository]:
+    """Find recent GitHub repositories discussed on Hacker News."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=PERIOD_DAYS[period])
+    try:
+        story_ids: list[int] = []
+        for feed in ("topstories", "newstories"):
+            response = requests.get(f"{HACKER_NEWS_API_URL}/{feed}.json", timeout=15)
+            response.raise_for_status()
+            story_ids.extend(response.json()[:60])
+
+        unique_ids = list(dict.fromkeys(story_ids))
+        items: list[dict] = []
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            futures = [executor.submit(_fetch_hacker_news_item, item_id) for item_id in unique_ids]
+            for future in as_completed(futures):
+                try:
+                    item = future.result()
+                except (requests.RequestException, ValueError, TypeError):
+                    continue
+                if (
+                    item
+                    and item.get("type") == "story"
+                    and item.get("time")
+                    and datetime.fromtimestamp(item["time"], timezone.utc) >= cutoff
+                    and _github_repo_name(item.get("url", ""))
+                ):
+                    items.append(item)
+
+        items.sort(key=lambda item: (item.get("score", 0), item.get("time", 0)), reverse=True)
+        repositories: list[Repository] = []
+        seen: set[str] = set()
+        for item in items:
+            full_name = _github_repo_name(item.get("url", ""))
+            if not full_name or full_name.lower() in seen:
+                continue
+            repository = _github_repository_from_hn(item, github_token)
+            if repository:
+                repositories.append(repository)
+                seen.add(full_name.lower())
+            if len(repositories) >= limit:
+                break
+        return repositories
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        LOG.warning("Hacker News feed unavailable: %s", exc)
+        return []
+
+
+def _repository_key(repository: Repository) -> str:
+    return (_github_repo_name(repository.url) or repository.name).lower()
+
+
+def merge_sources(
+    github_repositories: list[Repository],
+    hacker_news_repositories: list[Repository],
+    limit: int,
+) -> list[Repository]:
+    """Keep GitHub as the primary signal while reserving room for HN discoveries."""
+    result: list[Repository] = []
+    seen: set[str] = set()
+
+    def add(repository: Repository) -> None:
+        key = _repository_key(repository)
+        if key not in seen and len(result) < limit:
+            result.append(repository)
+            seen.add(key)
+
+    github_quota = max(1, limit - max(1, limit // 3))
+    for repository in github_repositories[:github_quota]:
+        add(repository)
+    for repository in hacker_news_repositories[: max(1, limit // 3)]:
+        add(repository)
+    for repository in github_repositories[github_quota:]:
+        add(repository)
+    for repository in hacker_news_repositories[max(1, limit // 3) :]:
+        add(repository)
+    return result
+
+
 def fallback_explanation(repo: Repository) -> str:
     if repo.description:
         return f"این پروژه دربارهٔ «{repo.description}» است و می‌تواند برای بررسی و یادگیری بیشتر مناسب باشد."
@@ -198,6 +349,10 @@ def build_message(period: str, repositories: Iterable[Repository], client=None, 
         stats = f"⭐ {html.escape(repo.stars)}  |  🍴 {html.escape(repo.forks)}  |  🧩 {html.escape(repo.language)}"
         if repo.stars_gained:
             stats += f"  |  📈 {html.escape(repo.stars_gained)}"
+        if repo.source != "GitHub":
+            stats += f"  |  📰 {html.escape(repo.source)}"
+            if repo.source_score:
+                stats += f"  |  ⬆️ {html.escape(repo.source_score)} امتیاز"
         lines.extend(
             [
                 f"<b>{index}. <a href=\"{html.escape(repo.url, quote=True)}\">{html.escape(repo.name)}</a></b>",
@@ -290,8 +445,10 @@ def main() -> int:
     client = make_gemini_client()
 
     for period in periods:
-        LOG.info("Fetching %s GitHub trends", period)
-        repositories = fetch_trending(period, limit, github_token)
+        LOG.info("Fetching %s GitHub and Hacker News trends", period)
+        github_repositories = fetch_trending(period, limit, github_token)
+        hacker_news_repositories = fetch_hacker_news(period, limit * 2, github_token)
+        repositories = merge_sources(github_repositories, hacker_news_repositories, limit)
         if not repositories:
             raise RuntimeError(f"No repositories found for {period}")
         message = build_message(period, repositories, client=client, model=gemini_model)
