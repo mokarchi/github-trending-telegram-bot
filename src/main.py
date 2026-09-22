@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import html
+import json
 import logging
 import os
 import re
@@ -25,6 +26,18 @@ GITHUB_TRENDING_URL = "https://github.com/trending"
 GITHUB_API_URL = "https://api.github.com"
 HACKER_NEWS_API_URL = "https://hacker-news.firebaseio.com/v0"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+DEFAULT_DOTNET_REPOSITORIES = (
+    "dotnet/runtime",
+    "dotnet/aspnetcore",
+    "dotnet/sdk",
+    "dotnet/roslyn",
+    "dotnet/efcore",
+    "dotnet/maui",
+    "dotnet/roslyn-analyzers",
+    "dotnet/templating",
+    "dotnet/msbuild",
+    "dotnet/diagnostics",
+)
 PERIOD_LABELS = {
     "daily": "روزانه",
     "weekly": "هفتگی",
@@ -302,6 +315,185 @@ def merge_sources(
     return result
 
 
+def _github_headers(github_token: str = "") -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "github-trending-telegram-bot/1.0",
+    }
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
+    return headers
+
+
+def _github_api_get(path: str, github_token: str = "", params: dict | None = None):
+    response = requests.get(
+        f"{GITHUB_API_URL}{path}",
+        headers=_github_headers(github_token),
+        params=params,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _github_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _dotnet_repositories() -> list[str]:
+    configured = os.getenv("DOTNET_REPOSITORIES", "").strip()
+    repositories = configured.split(",") if configured else DEFAULT_DOTNET_REPOSITORIES
+    return list(dict.fromkeys(repository.strip() for repository in repositories if repository.strip()))
+
+
+def _dotnet_repo_activity(
+    repository: str,
+    cutoff: datetime,
+    github_token: str,
+    max_items: int,
+) -> dict[str, list[dict]]:
+    activity = {"merges": [], "releases": [], "issues": [], "commits": []}
+    try:
+        pulls = _github_api_get(
+            f"/repos/{repository}/pulls",
+            github_token,
+            {"state": "closed", "sort": "updated", "direction": "desc", "per_page": 50},
+        )
+        for pull in pulls:
+            merged_at = _github_datetime(pull.get("merged_at"))
+            if not merged_at or merged_at < cutoff:
+                continue
+            activity["merges"].append(
+                {
+                    "repo": repository,
+                    "title": _clean(pull.get("title")) or f"PR #{pull.get('number')}",
+                    "url": pull.get("html_url", f"https://github.com/{repository}/pulls"),
+                    "author": _clean((pull.get("user") or {}).get("login")),
+                    "timestamp": pull.get("merged_at", ""),
+                }
+            )
+            if len(activity["merges"]) >= max_items:
+                break
+
+        releases = _github_api_get(
+            f"/repos/{repository}/releases",
+            github_token,
+            {"per_page": 20},
+        )
+        for release in releases:
+            published_at = _github_datetime(release.get("published_at") or release.get("created_at"))
+            if not published_at or published_at < cutoff:
+                continue
+            activity["releases"].append(
+                {
+                    "repo": repository,
+                    "title": _clean(release.get("name")) or _clean(release.get("tag_name")) or "Release",
+                    "tag": _clean(release.get("tag_name")),
+                    "url": release.get("html_url", f"https://github.com/{repository}/releases"),
+                    "timestamp": release.get("published_at") or release.get("created_at", ""),
+                }
+            )
+            if len(activity["releases"]) >= max_items:
+                break
+
+        issues = _github_api_get(
+            f"/repos/{repository}/issues",
+            github_token,
+            {"state": "all", "sort": "updated", "direction": "desc", "per_page": 50},
+        )
+        recent_issues = []
+        for issue in issues:
+            if issue.get("pull_request"):
+                continue
+            updated_at = _github_datetime(issue.get("updated_at"))
+            if not updated_at or updated_at < cutoff:
+                continue
+            labels = [
+                _clean(label.get("name"))
+                for label in issue.get("labels", [])
+                if _clean(label.get("name"))
+            ]
+            recent_issues.append(
+                {
+                    "repo": repository,
+                    "title": _clean(issue.get("title")) or f"Issue #{issue.get('number')}",
+                    "url": issue.get("html_url", f"https://github.com/{repository}/issues"),
+                    "comments": int(issue.get("comments", 0) or 0),
+                    "labels": labels,
+                    "timestamp": issue.get("updated_at", ""),
+                }
+            )
+        recent_issues.sort(
+            key=lambda item: (item["comments"], item.get("timestamp", "")), reverse=True
+        )
+        activity["issues"] = recent_issues[:max_items]
+
+        commits = _github_api_get(
+            f"/repos/{repository}/commits",
+            github_token,
+            {"since": cutoff.isoformat(), "per_page": 50},
+        )
+        if commits:
+            activity["commits"].append(
+                {
+                    "repo": repository,
+                    "count": len(commits),
+                    "subjects": [
+                        _clean((commit.get("commit") or {}).get("message", "")).split("\n", 1)[0]
+                        for commit in commits[:3]
+                        if _clean((commit.get("commit") or {}).get("message", ""))
+                    ],
+                    "url": f"https://github.com/{repository}/commits",
+                }
+            )
+    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+        LOG.warning("Could not inspect .NET repository %s: %s", repository, exc)
+    return activity
+
+
+def fetch_dotnet_updates(
+    lookback_hours: int = 26,
+    max_items: int = 10,
+    github_token: str = "",
+) -> dict[str, list[dict]]:
+    """Collect notable activity from Microsoft's official dotnet GitHub organization."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    combined = {"merges": [], "releases": [], "issues": [], "commits": []}
+    repositories = _dotnet_repositories()
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(repositories)))) as executor:
+        futures = {
+            executor.submit(
+                _dotnet_repo_activity, repository, cutoff, github_token, max_items
+            ): repository
+            for repository in repositories
+        }
+        for future in as_completed(futures):
+            repository = futures[future]
+            try:
+                activity = future.result()
+            except Exception as exc:  # keep one unavailable repo from blocking the digest
+                LOG.warning(".NET repository task failed for %s: %s", repository, exc)
+                continue
+            for category, items in activity.items():
+                combined[category].extend(items)
+
+    combined["merges"].sort(key=lambda item: item.get("timestamp", ""), reverse=True)
+    combined["releases"].sort(key=lambda item: item.get("timestamp", ""), reverse=True)
+    combined["issues"].sort(
+        key=lambda item: (item.get("comments", 0), item.get("timestamp", "")), reverse=True
+    )
+    combined["merges"] = combined["merges"][:max_items]
+    combined["releases"] = combined["releases"][:max_items]
+    combined["issues"] = combined["issues"][:max_items]
+    combined["commits"] = sorted(combined["commits"], key=lambda item: item["count"], reverse=True)
+    return combined
+
+
 def fallback_explanation(repo: Repository) -> str:
     if repo.description:
         return f"این پروژه دربارهٔ «{repo.description}» است و می‌تواند برای بررسی و یادگیری بیشتر مناسب باشد."
@@ -365,6 +557,98 @@ def build_message(period: str, repositories: Iterable[Repository], client=None, 
     return "\n".join(lines).strip()
 
 
+def _dotnet_ai_summary(updates: dict[str, list[dict]], client=None, model: str = "gemini-3.5-flash-lite") -> str:
+    if client is None:
+        return "در این بازه، مرج‌ها، ریلیزها، issueهای فعال و خلاصهٔ commitهای پروژه‌های رسمی .NET بررسی شده‌اند."
+    compact = {
+        "merges": updates.get("merges", [])[:10],
+        "releases": updates.get("releases", [])[:10],
+        "issues": updates.get("issues", [])[:10],
+        "commits": updates.get("commits", [])[:10],
+    }
+    prompt = f"""
+تو سردبیر فنی فارسی‌زبان هستی. از دادهٔ JSON زیر یک جمع‌بندی کوتاه برای گزارش روزانهٔ پروژه‌های رسمی .NET مایکروسافت بنویس.
+حداکثر ۶ bullet کوتاه با خط جدید، بدون Markdown و بدون ادعای جدید. روی تغییرات مهم، ریلیزها و اثر احتمالی آن‌ها برای توسعه‌دهنده تمرکز کن.
+اگر داده‌ای وجود ندارد، همان بخش را نادیده بگیر.
+داده:
+{json.dumps(compact, ensure_ascii=False)}
+""".strip()
+    try:
+        from google.genai import types
+
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction="پاسخ را فقط به فارسی روان و فنی برگردان.",
+                temperature=0.2,
+                max_output_tokens=420,
+            ),
+        )
+        text = _clean(getattr(response, "text", ""))
+        return text or "تغییرات جدید پروژه‌های رسمی .NET در فهرست زیر آمده است."
+    except Exception as exc:
+        LOG.warning(".NET Persian summary failed: %s", exc)
+        return "تغییرات جدید پروژه‌های رسمی .NET در فهرست زیر آمده است."
+
+
+def _dotnet_link_line(item: dict, prefix: str = "") -> str:
+    title = html.escape(item.get("title", ""))
+    repo = html.escape(item.get("repo", ""))
+    url = html.escape(item.get("url", "https://github.com/dotnet"), quote=True)
+    suffix = f" — {html.escape(item['author'])}" if item.get("author") else ""
+    if item.get("tag"):
+        suffix += f" ({html.escape(item['tag'])})"
+    if item.get("comments"):
+        suffix += f" · 💬 {item['comments']}"
+    return f"• {prefix}<a href=\"{url}\">{repo}: {title}</a>{suffix}"
+
+
+def build_dotnet_message(
+    updates: dict[str, list[dict]], client=None, model: str = "gemini-3.5-flash-lite"
+) -> str:
+    """Build a compact daily digest of notable official .NET activity."""
+    now = datetime.now(ZoneInfo(os.getenv("TIMEZONE", "Asia/Tehran")))
+    merges = updates.get("merges", [])
+    releases = updates.get("releases", [])
+    issues = updates.get("issues", [])
+    commits = updates.get("commits", [])
+    total_commits = sum(item.get("count", 0) for item in commits)
+    lines = [
+        "<b>گزارش روزانه پروژه‌های .NET مایکروسافت</b>",
+        f"<i>{now:%Y-%m-%d %H:%M} به وقت تهران</i>",
+        f"مرج: {len(merges)}  |  ریلیز: {len(releases)}  |  issue مهم: {len(issues)}  |  commit: {total_commits}",
+        "",
+        f"<b>جمع‌بندی فارسی</b>\n{html.escape(_dotnet_ai_summary(updates, client, model))}",
+        "",
+    ]
+    if releases:
+        lines.append("<b>🚀 ریلیزهای جدید</b>")
+        lines.extend(_dotnet_link_line(item) for item in releases)
+        lines.append("")
+    if merges:
+        lines.append("<b>🔀 Mergeهای جدید</b>")
+        lines.extend(_dotnet_link_line(item) for item in merges)
+        lines.append("")
+    if issues:
+        lines.append("<b>🔥 Issueهای فعال</b>")
+        lines.extend(_dotnet_link_line(item) for item in issues)
+        lines.append("")
+    if commits:
+        lines.append("<b>🧱 خلاصهٔ commitها</b>")
+        for item in commits:
+            repo = html.escape(item.get("repo", ""))
+            url = html.escape(item.get("url", "https://github.com/dotnet"), quote=True)
+            subjects = "؛ ".join(html.escape(subject) for subject in item.get("subjects", []))
+            detail = f" — {subjects}" if subjects else ""
+            lines.append(
+                f"• <a href=\"{url}\">{repo}</a>: {item.get('count', 0)} commit{detail}"
+            )
+    if not any((merges, releases, issues, commits)):
+        lines.append("در بازهٔ بررسی‌شده تغییر قابل‌توجهی پیدا نشد؛ این خودش خبر خوبی برای یک روز آرام است. 🌱")
+    return "\n".join(lines).strip()
+
+
 def split_message(text: str, limit: int = 3900) -> list[str]:
     if len(text) <= limit:
         return [text]
@@ -410,10 +694,10 @@ def send_telegram(text: str, token: str, chat_id: str) -> None:
 
 def periods_for_run(period: str, now: datetime) -> list[str]:
     if period != "auto":
-        return [period] if period != "all" else list(PERIOD_LABELS)
+        return [period] if period != "all" else [*PERIOD_LABELS, "dotnet"]
     weekly_day = int(os.getenv("WEEKLY_DAY", "0"))
     monthly_day = int(os.getenv("MONTHLY_DAY", "1"))
-    result = ["daily"]
+    result = ["daily", "dotnet"]
     if now.weekday() == weekly_day:
         result.append("weekly")
     if now.day == monthly_day:
@@ -433,7 +717,11 @@ def make_gemini_client():
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--period", choices=["auto", "daily", "weekly", "monthly", "all"], default="auto")
+    parser.add_argument(
+        "--period",
+        choices=["auto", "daily", "weekly", "monthly", "dotnet", "all"],
+        default="auto",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(levelname)s %(message)s")
@@ -446,6 +734,21 @@ def main() -> int:
     client = make_gemini_client()
 
     for period in periods:
+        if period == "dotnet":
+            LOG.info("Fetching daily Microsoft .NET activity")
+            updates = fetch_dotnet_updates(
+                lookback_hours=max(1, int(os.getenv("DOTNET_LOOKBACK_HOURS", "26"))),
+                max_items=max(1, min(int(os.getenv("DOTNET_MAX_ITEMS", "10")), 20)),
+                github_token=github_token,
+            )
+            message = build_dotnet_message(updates, client=client, model=gemini_model)
+            send_telegram(
+                message,
+                os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+                os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+            )
+            LOG.info("Sent Microsoft .NET activity digest")
+            continue
         LOG.info("Fetching %s GitHub and Hacker News trends", period)
         github_repositories = fetch_trending(period, limit, github_token)
         hacker_news_repositories = fetch_hacker_news(period, limit * 2, github_token)
