@@ -492,7 +492,9 @@ def fetch_dotnet_updates(
     combined["merges"] = combined["merges"][:max_items]
     combined["releases"] = combined["releases"][:max_items]
     combined["issues"] = combined["issues"][:max_items]
-    combined["commits"] = sorted(combined["commits"], key=lambda item: item["count"], reverse=True)
+    combined["commits"] = sorted(
+        combined["commits"], key=lambda item: item["count"], reverse=True
+    )[:max_items]
     return combined
 
 
@@ -566,22 +568,13 @@ def _dotnet_fallback_report(updates: dict[str, list[dict]]) -> dict[str, list[st
             f"در ۲۶ ساعت گذشته {len(updates.get('merges', []))} تغییر در پروژه‌های رسمی .NET ادغام شده است.",
             f"{len(updates.get('releases', []))} انتشار، {len(updates.get('issues', []))} ایراد فعال و خلاصهٔ تغییرات کد بررسی شد.",
         ],
-        "merges": [
-            "یک تغییر مهم در این پروژه ادغام شده است؛ برای جزئیات بیشتر، لینک را باز کنید."
-            for _ in updates.get("merges", [])
-        ],
-        "releases": [
-            f"انتشار نسخهٔ {item.get('tag') or 'جدید'} آماده شده است."
-            for item in updates.get("releases", [])
-        ],
-        "issues": [
-            f"ایراد فعال این پروژه در این بازه {item.get('comments', 0)} نظر داشته است."
-            for item in updates.get("issues", [])
-        ],
-        "commits": [
-            f"در این پروژه {item.get('count', 0)} تغییر کد ثبت شده است."
-            for item in updates.get("commits", [])
-        ],
+        # Do not invent a useless description or leak raw English titles when
+        # Gemini is unavailable. The overview remains useful; item sections
+        # are omitted until a real Persian summary is available.
+        "merges": [],
+        "releases": [],
+        "issues": [],
+        "commits": [],
     }
 
 
@@ -629,10 +622,10 @@ def _dotnet_localized_report(
 ساختار خروجی دقیقاً این باشد:
 {{"summary": ["..."], "merges": ["..."], "releases": ["..."], "issues": ["..."], "commits": ["..."]}}
 آرایه‌های merges، releases، issues و commits را دقیقاً به همان ترتیب ورودی و با همان تعداد برگردان.
-برای هر Merge و commit، عنوان انگلیسی را به فارسی خلاصه کن و بگو چه چیزی تغییر کرده و چرا مهم است.
-برای issue، مشکل را به فارسی خلاصه کن و اثر احتمالی آن را بگو.
+برای هر Merge و commit، دقیقاً بگو چه چیزی تغییر کرده و اثر یا دلیل اهمیت آن چیست؛ از جملهٔ کلی مثل «یک تغییر مهم انجام شد» استفاده نکن.
+برای issue، خود مشکل را به فارسی خلاصه کن و بگو برای کدام قابلیت یا گروه از کاربران مهم است؛ تعداد نظر به‌تنهایی خلاصه محسوب نمی‌شود.
 برای release، قابلیت یا اصلاح اصلی را فارسی و کوتاه توضیح بده.
-در summary حداکثر ۴ نکتهٔ مهم بنویس. از متن انگلیسی طولانی، Markdown، bullet marker و تکرار عنوان خام خودداری کن.
+برای هر مورد حداکثر یک جملهٔ کوتاه بنویس. در summary حداکثر ۴ نکتهٔ مهم بنویس. از متن انگلیسی طولانی، Markdown، bullet marker و تکرار عنوان خام خودداری کن.
 نام‌های فنی ضروری مانند .NET، MAUI، NativeAOT، API، JSON، SDK و نام ریپوها را می‌توانی حفظ کنی.
 داده:
 {json.dumps(compact, ensure_ascii=False)}
@@ -646,7 +639,7 @@ def _dotnet_localized_report(
             config=types.GenerateContentConfig(
                 system_instruction="فقط JSON معتبر با متن فارسی تولید کن.",
                 temperature=0.1,
-                max_output_tokens=2200,
+                max_output_tokens=1600,
             ),
         )
         parsed = _parse_json_response(getattr(response, "text", ""))
@@ -662,10 +655,7 @@ def _dotnet_localized_report(
             if key == "summary" and not localized_values:
                 result[key] = fallback[key]
                 continue
-            expected = len(fallback[key])
-            if len(localized_values) < expected:
-                localized_values.extend(fallback[key][len(localized_values) : expected])
-            result[key] = localized_values[:expected]
+            result[key] = localized_values[: len(fallback[key]) or len(localized_values)]
         return result
     except Exception as exc:
         LOG.warning(".NET Persian localization failed; using safe fallback: %s", exc)
@@ -703,28 +693,28 @@ def build_dotnet_message(
     ]
     lines.extend(f"• {html.escape(item)}" for item in localized["summary"])
     lines.append("")
-    if releases:
+    if releases and localized["releases"]:
         lines.append("<b>🚀 انتشارهای جدید</b>")
         lines.extend(
             _dotnet_link_line(item, description)
             for item, description in zip(releases, localized["releases"])
         )
         lines.append("")
-    if merges:
+    if merges and localized["merges"]:
         lines.append("<b>🔀 ادغام‌های جدید</b>")
         lines.extend(
             _dotnet_link_line(item, description)
             for item, description in zip(merges, localized["merges"])
         )
         lines.append("")
-    if issues:
+    if issues and localized["issues"]:
         lines.append("<b>🔥 ایرادهای فعال</b>")
         lines.extend(
             _dotnet_link_line(item, description)
             for item, description in zip(issues, localized["issues"])
         )
         lines.append("")
-    if commits:
+    if commits and localized["commits"]:
         lines.append("<b>🧱 تغییرات کد</b>")
         for item, description in zip(commits, localized["commits"]):
             repo = html.escape(item.get("repo", ""))

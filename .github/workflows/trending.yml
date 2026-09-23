@@ -56,5 +56,5 @@ jobs:
           WEEKLY_DAY: 0
           MONTHLY_DAY: 1
           DOTNET_LOOKBACK_HOURS: 26
-          DOTNET_MAX_ITEMS: 10
+          DOTNET_MAX_ITEMS: 5
         run: python src/main.py --period "${{ github.event.inputs.period || 'auto' }}"
