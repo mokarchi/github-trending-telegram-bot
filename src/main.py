@@ -646,23 +646,26 @@ def _dotnet_localized_report(
             config=types.GenerateContentConfig(
                 system_instruction="فقط JSON معتبر با متن فارسی تولید کن.",
                 temperature=0.1,
-                max_output_tokens=1400,
+                max_output_tokens=2200,
             ),
         )
         parsed = _parse_json_response(getattr(response, "text", ""))
         result: dict[str, list[str]] = {}
         for key in ("summary", "merges", "releases", "issues", "commits"):
             values = parsed.get(key)
-            if (
-                not isinstance(values, list)
-                or (key == "summary" and not values)
-                or not all(isinstance(value, str) and value.strip() for value in values)
-            ):
-                raise ValueError(f"Invalid localized {key} list")
-            result[key] = [_clean(value) for value in values]
-        for key in ("merges", "releases", "issues", "commits"):
-            if len(result[key]) != len(fallback[key]):
-                raise ValueError(f"Localized {key} count did not match input")
+            if not isinstance(values, list):
+                result[key] = fallback[key]
+                continue
+            localized_values = [
+                _clean(value) for value in values if isinstance(value, str) and value.strip()
+            ]
+            if key == "summary" and not localized_values:
+                result[key] = fallback[key]
+                continue
+            expected = len(fallback[key])
+            if len(localized_values) < expected:
+                localized_values.extend(fallback[key][len(localized_values) : expected])
+            result[key] = localized_values[:expected]
         return result
     except Exception as exc:
         LOG.warning(".NET Persian localization failed; using safe fallback: %s", exc)
