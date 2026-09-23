@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from main import parse_trending_html, periods_for_run, split_message
+from main import build_dotnet_message, parse_trending_html, periods_for_run, split_message
 
 
 HTML = """
@@ -34,6 +34,34 @@ def test_split_message():
 
 def test_periods_for_run():
     assert periods_for_run("daily", None) == ["daily"]
+
+
+def test_dotnet_message_has_persian_fallback_descriptions():
+    updates = {
+        "merges": [
+            {
+                "repo": "dotnet/runtime",
+                "title": "Fix NativeAOT issue",
+                "url": "https://github.com/dotnet/runtime/pull/1",
+                "author": "developer",
+            }
+        ],
+        "releases": [],
+        "issues": [],
+        "commits": [
+            {
+                "repo": "dotnet/runtime",
+                "count": 2,
+                "subjects": ["Fix NativeAOT issue"],
+                "url": "https://github.com/dotnet/runtime/commits",
+            }
+        ],
+    }
+    message = build_dotnet_message(updates)
+    assert "ادغام‌های جدید" in message
+    assert "تغییرات کد" in message
+    assert "Fix NativeAOT issue" not in message
+    assert "Mergeهای" not in message
 
 
 if __name__ == "__main__":

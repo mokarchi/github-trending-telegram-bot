@@ -559,19 +559,81 @@ def build_message(period: str, repositories: Iterable[Repository], client=None, 
     return "\n".join(lines).strip()
 
 
-def _dotnet_ai_summary(updates: dict[str, list[dict]], client=None, model: str = "gemini-3.5-flash-lite") -> str:
+def _dotnet_fallback_report(updates: dict[str, list[dict]]) -> dict[str, list[str]]:
+    """Build a Persian-only report when the translation service is unavailable."""
+    return {
+        "summary": [
+            f"در ۲۶ ساعت گذشته {len(updates.get('merges', []))} تغییر در پروژه‌های رسمی .NET ادغام شده است.",
+            f"{len(updates.get('releases', []))} انتشار، {len(updates.get('issues', []))} ایراد فعال و خلاصهٔ تغییرات کد بررسی شد.",
+        ],
+        "merges": [
+            "یک تغییر مهم در این پروژه ادغام شده است؛ برای جزئیات بیشتر، لینک را باز کنید."
+            for _ in updates.get("merges", [])
+        ],
+        "releases": [
+            f"انتشار نسخهٔ {item.get('tag') or 'جدید'} آماده شده است."
+            for item in updates.get("releases", [])
+        ],
+        "issues": [
+            f"ایراد فعال این پروژه در این بازه {item.get('comments', 0)} نظر داشته است."
+            for item in updates.get("issues", [])
+        ],
+        "commits": [
+            f"در این پروژه {item.get('count', 0)} تغییر کد ثبت شده است."
+            for item in updates.get("commits", [])
+        ],
+    }
+
+
+def _parse_json_response(value: str) -> dict:
+    value = value.strip()
+    if value.startswith("```"):
+        value = re.sub(r"^```(?:json)?\s*|\s*```$", "", value, flags=re.IGNORECASE | re.DOTALL).strip()
+    start, end = value.find("{"), value.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("AI response did not contain a JSON object")
+    parsed = json.loads(value[start : end + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("AI response was not a JSON object")
+    return parsed
+
+
+def _dotnet_localized_report(
+    updates: dict[str, list[dict]], client=None, model: str = "gemini-3.5-flash-lite"
+) -> dict[str, list[str]]:
+    fallback = _dotnet_fallback_report(updates)
     if client is None:
-        return "در این بازه، مرج‌ها، ریلیزها، issueهای فعال و خلاصهٔ commitهای پروژه‌های رسمی .NET بررسی شده‌اند."
+        return fallback
+
     compact = {
-        "merges": updates.get("merges", [])[:10],
-        "releases": updates.get("releases", [])[:10],
-        "issues": updates.get("issues", [])[:10],
-        "commits": updates.get("commits", [])[:10],
+        "merges": [
+            {"repo": item.get("repo", ""), "title": item.get("title", "")}
+            for item in updates.get("merges", [])[:10]
+        ],
+        "releases": [
+            {"repo": item.get("repo", ""), "tag": item.get("tag", ""), "title": item.get("title", "")}
+            for item in updates.get("releases", [])[:10]
+        ],
+        "issues": [
+            {"repo": item.get("repo", ""), "title": item.get("title", ""), "comments": item.get("comments", 0)}
+            for item in updates.get("issues", [])[:10]
+        ],
+        "commits": [
+            {"repo": item.get("repo", ""), "count": item.get("count", 0), "subjects": item.get("subjects", [])}
+            for item in updates.get("commits", [])[:10]
+        ],
     }
     prompt = f"""
-تو سردبیر فنی فارسی‌زبان هستی. از دادهٔ JSON زیر یک جمع‌بندی کوتاه برای گزارش روزانهٔ پروژه‌های رسمی .NET مایکروسافت بنویس.
-حداکثر ۶ bullet کوتاه با خط جدید، بدون Markdown و بدون ادعای جدید. روی تغییرات مهم، ریلیزها و اثر احتمالی آن‌ها برای توسعه‌دهنده تمرکز کن.
-اگر داده‌ای وجود ندارد، همان بخش را نادیده بگیر.
+تو ویراستار فنی فارسی‌زبان هستی. دادهٔ زیر فعالیت ۲۶ ساعت اخیر پروژه‌های رسمی .NET مایکروسافت است.
+فقط یک JSON معتبر برگردان و هیچ متن دیگری ننویس. مقدار همهٔ رشته‌ها باید فارسی روان و کوتاه باشد.
+ساختار خروجی دقیقاً این باشد:
+{{"summary": ["..."], "merges": ["..."], "releases": ["..."], "issues": ["..."], "commits": ["..."]}}
+آرایه‌های merges، releases، issues و commits را دقیقاً به همان ترتیب ورودی و با همان تعداد برگردان.
+برای هر Merge و commit، عنوان انگلیسی را به فارسی خلاصه کن و بگو چه چیزی تغییر کرده و چرا مهم است.
+برای issue، مشکل را به فارسی خلاصه کن و اثر احتمالی آن را بگو.
+برای release، قابلیت یا اصلاح اصلی را فارسی و کوتاه توضیح بده.
+در summary حداکثر ۴ نکتهٔ مهم بنویس. از متن انگلیسی طولانی، Markdown، bullet marker و تکرار عنوان خام خودداری کن.
+نام‌های فنی ضروری مانند .NET، MAUI، NativeAOT، API، JSON، SDK و نام ریپوها را می‌توانی حفظ کنی.
 داده:
 {json.dumps(compact, ensure_ascii=False)}
 """.strip()
@@ -582,28 +644,40 @@ def _dotnet_ai_summary(updates: dict[str, list[dict]], client=None, model: str =
             model=model,
             contents=prompt,
             config=types.GenerateContentConfig(
-                system_instruction="پاسخ را فقط به فارسی روان و فنی برگردان.",
-                temperature=0.2,
-                max_output_tokens=420,
+                system_instruction="فقط JSON معتبر با متن فارسی تولید کن.",
+                temperature=0.1,
+                max_output_tokens=1400,
             ),
         )
-        text = _clean(getattr(response, "text", ""))
-        return text or "تغییرات جدید پروژه‌های رسمی .NET در فهرست زیر آمده است."
+        parsed = _parse_json_response(getattr(response, "text", ""))
+        result: dict[str, list[str]] = {}
+        for key in ("summary", "merges", "releases", "issues", "commits"):
+            values = parsed.get(key)
+            if (
+                not isinstance(values, list)
+                or (key == "summary" and not values)
+                or not all(isinstance(value, str) and value.strip() for value in values)
+            ):
+                raise ValueError(f"Invalid localized {key} list")
+            result[key] = [_clean(value) for value in values]
+        for key in ("merges", "releases", "issues", "commits"):
+            if len(result[key]) != len(fallback[key]):
+                raise ValueError(f"Localized {key} count did not match input")
+        return result
     except Exception as exc:
-        LOG.warning(".NET Persian summary failed: %s", exc)
-        return "تغییرات جدید پروژه‌های رسمی .NET در فهرست زیر آمده است."
+        LOG.warning(".NET Persian localization failed; using safe fallback: %s", exc)
+        return fallback
 
 
-def _dotnet_link_line(item: dict, prefix: str = "") -> str:
-    title = html.escape(item.get("title", ""))
+def _dotnet_link_line(item: dict, description: str, prefix: str = "") -> str:
     repo = html.escape(item.get("repo", ""))
     url = html.escape(item.get("url", "https://github.com/dotnet"), quote=True)
-    suffix = f" — {html.escape(item['author'])}" if item.get("author") else ""
+    suffix = f" — نویسنده: {html.escape(item['author'])}" if item.get("author") else ""
     if item.get("tag"):
-        suffix += f" ({html.escape(item['tag'])})"
+        suffix += f" — نسخهٔ {html.escape(item['tag'])}"
     if item.get("comments"):
-        suffix += f" · 💬 {item['comments']}"
-    return f"• {prefix}<a href=\"{url}\">{repo}: {title}</a>{suffix}"
+        suffix += f" — 💬 {item['comments']} نظر"
+    return f"• {prefix}<a href=\"{url}\">{repo}</a>: {html.escape(description)}{suffix}"
 
 
 def build_dotnet_message(
@@ -615,36 +689,46 @@ def build_dotnet_message(
     releases = updates.get("releases", [])
     issues = updates.get("issues", [])
     commits = updates.get("commits", [])
+    localized = _dotnet_localized_report(updates, client=client, model=model)
     total_commits = sum(item.get("count", 0) for item in commits)
     lines = [
         "<b>گزارش روزانه پروژه‌های .NET مایکروسافت</b>",
         f"<i>{now:%Y-%m-%d %H:%M} به وقت تهران</i>",
-        f"مرج: {len(merges)}  |  ریلیز: {len(releases)}  |  issue مهم: {len(issues)}  |  commit: {total_commits}",
+        f"ادغام: {len(merges)}  |  انتشار: {len(releases)}  |  ایراد مهم: {len(issues)}  |  تغییر کد: {total_commits}",
         "",
-        f"<b>جمع‌بندی فارسی</b>\n{html.escape(_dotnet_ai_summary(updates, client, model))}",
-        "",
+        "<b>جمع‌بندی فارسی</b>",
     ]
+    lines.extend(f"• {html.escape(item)}" for item in localized["summary"])
+    lines.append("")
     if releases:
-        lines.append("<b>🚀 ریلیزهای جدید</b>")
-        lines.extend(_dotnet_link_line(item) for item in releases)
+        lines.append("<b>🚀 انتشارهای جدید</b>")
+        lines.extend(
+            _dotnet_link_line(item, description)
+            for item, description in zip(releases, localized["releases"])
+        )
         lines.append("")
     if merges:
-        lines.append("<b>🔀 Mergeهای جدید</b>")
-        lines.extend(_dotnet_link_line(item) for item in merges)
+        lines.append("<b>🔀 ادغام‌های جدید</b>")
+        lines.extend(
+            _dotnet_link_line(item, description)
+            for item, description in zip(merges, localized["merges"])
+        )
         lines.append("")
     if issues:
-        lines.append("<b>🔥 Issueهای فعال</b>")
-        lines.extend(_dotnet_link_line(item) for item in issues)
+        lines.append("<b>🔥 ایرادهای فعال</b>")
+        lines.extend(
+            _dotnet_link_line(item, description)
+            for item, description in zip(issues, localized["issues"])
+        )
         lines.append("")
     if commits:
-        lines.append("<b>🧱 خلاصهٔ commitها</b>")
-        for item in commits:
+        lines.append("<b>🧱 تغییرات کد</b>")
+        for item, description in zip(commits, localized["commits"]):
             repo = html.escape(item.get("repo", ""))
             url = html.escape(item.get("url", "https://github.com/dotnet"), quote=True)
-            subjects = "؛ ".join(html.escape(subject) for subject in item.get("subjects", []))
-            detail = f" — {subjects}" if subjects else ""
             lines.append(
-                f"• <a href=\"{url}\">{repo}</a>: {item.get('count', 0)} commit{detail}"
+                f"• <a href=\"{url}\">{repo}</a>: {html.escape(description)} "
+                f"(تعداد تغییرات: {item.get('count', 0)})"
             )
     if not any((merges, releases, issues, commits)):
         lines.append("در بازهٔ بررسی‌شده تغییر قابل‌توجهی پیدا نشد؛ این خودش خبر خوبی برای یک روز آرام است. 🌱")
