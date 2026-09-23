@@ -241,10 +241,12 @@ def fetch_hacker_news(
     cutoff = datetime.now(timezone.utc) - timedelta(days=PERIOD_DAYS[period])
     try:
         story_ids: list[int] = []
+        # Keep the daily run bounded: both feeds overlap heavily, and fetching
+        # the first 40 from each is enough to find the requested repositories.
         for feed in ("topstories", "newstories"):
             response = requests.get(f"{HACKER_NEWS_API_URL}/{feed}.json", timeout=15)
             response.raise_for_status()
-            story_ids.extend(response.json()[:60])
+            story_ids.extend(response.json()[:40])
 
         unique_ids = list(dict.fromkeys(story_ids))
         items: list[dict] = []

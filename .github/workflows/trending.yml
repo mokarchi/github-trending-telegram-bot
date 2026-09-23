@@ -16,8 +16,13 @@ on:
           - dotnet
           - all
   schedule:
-    - cron: "30 6 * * *"
+    # Run at an off-peak minute to reduce GitHub Actions scheduler delays.
+    - cron: "17 6 * * *"
       timezone: "Asia/Tehran"
+
+concurrency:
+  group: github-trending-telegram
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -25,7 +30,7 @@ permissions:
 jobs:
   send-trends:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
