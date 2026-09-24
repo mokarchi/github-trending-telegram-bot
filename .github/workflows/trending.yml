@@ -1,5 +1,4 @@
 name: GitHub Trending to Telegram
-
 on:
   workflow_dispatch:
     inputs:
@@ -16,17 +15,15 @@ on:
           - dotnet
           - all
   schedule:
-    # Run at an off-peak minute to reduce GitHub Actions scheduler delays.
-    - cron: "17 6 * * *"
-      timezone: "Asia/Tehran"
-
+    # 06:17 Asia/Tehran: GitHub Trending + Hacker News
+    - cron: "47 2 * * *"
+    # 07:47 Asia/Tehran: Microsoft .NET activity
+    - cron: "17 4 * * *"
 concurrency:
   group: github-trending-telegram
   cancel-in-progress: false
-
 permissions:
   contents: read
-
 jobs:
   send-trends:
     runs-on: ubuntu-latest
@@ -34,22 +31,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
-
       - name: Send trends
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCHEDULE_CRON: ${{ github.event.schedule || '' }}
           GEMINI_MODEL: gemini-3.5-flash-lite
           TIMEZONE: Asia/Tehran
           TOP_N: 10
@@ -57,4 +52,9 @@ jobs:
           MONTHLY_DAY: 1
           DOTNET_LOOKBACK_HOURS: 26
           DOTNET_MAX_ITEMS: 5
-        run: python src/main.py --period "${{ github.event.inputs.period || 'auto' }}"
+        run: |
+          if [ "$SCHEDULE_CRON" = "17 4 * * *" ]; then
+            python src/main.py --period dotnet
+          else
+            python src/main.py --period "${{ github.event.inputs.period || 'auto' }}"
+          fi
