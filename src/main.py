@@ -776,7 +776,7 @@ def periods_for_run(period: str, now: datetime) -> list[str]:
         return [period] if period != "all" else [*PERIOD_LABELS, "dotnet"]
     weekly_day = int(os.getenv("WEEKLY_DAY", "0"))
     monthly_day = int(os.getenv("MONTHLY_DAY", "1"))
-    result = ["daily", "dotnet"]
+    result = ["daily"]
     if now.weekday() == weekly_day:
         result.append("weekly")
     if now.day == monthly_day:
